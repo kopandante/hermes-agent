@@ -1022,6 +1022,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "update_prompt": self._cb_update_prompt,
             "clarify": self._cb_clarify,
             "exec_approve": self._cb_exec_approve,
+            "model": self._cb_model,
         }
         handler = handlers.get(prefix)
         if handler:
@@ -1141,6 +1142,369 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             return SendResult(success=False, error=str(e))
+
+    # -- Model picker (inline keyboard) --
+
+    async def send_model_picker(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send inline keyboard with available providers for model selection."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            from agent.providers import available_providers
+            providers = available_providers()
+            if not providers:
+                return await self.send(
+                    chat_id, "No providers configured. Set API keys in env.",
+                    metadata=metadata,
+                )
+
+            buttons = [
+                [InlineKeyboardButton(p, callback_data=f"model:p:{p}")]
+                for p in providers
+            ]
+            markup = InlineKeyboardMarkup(buttons)
+            kwargs = {}
+            if metadata and metadata.get("thread_id"):
+                kwargs["message_thread_id"] = int(metadata["thread_id"])
+            msg = await self._bot.send_message(
+                chat_id=int(chat_id),
+                text="Select provider:",
+                reply_markup=markup,
+                **kwargs,
+            )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_model_picker failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
+    async def _cb_model(self, query, data: str) -> None:
+        """Handle model picker inline keyboard callbacks.
+
+        Callback data formats:
+          model:p:<provider>           -- provider selected
+          model:f:<provider>:<family>  -- family selected
+          model:s:<index>              -- model selected (index into state)
+        """
+        parts = data.split(":")
+        if len(parts) < 3:
+            await query.answer(text="Invalid")
+            return
+
+        action = parts[1]
+
+        if action == "p":
+            await self._model_pick_provider(query, parts[2])
+        elif action == "f":
+            if len(parts) < 4:
+                await query.answer(text="Invalid")
+                return
+            await self._model_pick_family(query, parts[2], parts[3])
+        elif action == "s":
+            await self._model_pick_set(query, parts[2])
+        elif action == "n":
+            # Pagination: model:n:<provider>:<page>
+            if len(parts) < 4:
+                await query.answer(text="Invalid")
+                return
+            await self._model_pick_page(query, parts[2], int(parts[3]))
+        else:
+            await query.answer(text="Unknown action")
+
+    async def _model_pick_provider(self, query, provider_name: str) -> None:
+        """Fetch models for provider and show family buttons."""
+        # "_back" re-shows the provider picker
+        if provider_name == "_back":
+            from agent.providers import available_providers
+            providers = available_providers()
+            buttons = [
+                [InlineKeyboardButton(p, callback_data=f"model:p:{p}")]
+                for p in providers
+            ]
+            await query.edit_message_text(
+                text="Select provider:",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            await query.answer()
+            return
+
+        await query.answer(text=f"Loading {provider_name}...")
+        try:
+            from agent.providers import (
+                PROVIDER_FACTORIES,
+                _env_getter,
+                fetch_models,
+                group_models,
+            )
+            factory = PROVIDER_FACTORIES.get(provider_name)
+            if not factory:
+                await query.edit_message_text(text=f"Unknown provider: {provider_name}")
+                return
+            provider = factory(_env_getter)
+            models = await fetch_models(provider)
+            if not models:
+                await query.edit_message_text(
+                    text=f"No models found for {provider_name}."
+                )
+                return
+
+            # Store state for later index-based selection
+            if not hasattr(self, "_model_picker_state"):
+                self._model_picker_state = {}
+            self._model_picker_state[str(query.message.chat.id)] = {
+                "provider": provider_name,
+                "models": models,
+            }
+
+            groups = group_models(models)
+            buttons = []
+            for family in groups:
+                cb = f"model:f:{provider_name}:{family}"
+                if len(cb.encode("utf-8")) <= 64:
+                    buttons.append(
+                        [InlineKeyboardButton(
+                            f"{family} ({len(groups[family])})",
+                            callback_data=cb,
+                        )]
+                    )
+            # "All" button
+            buttons.append(
+                [InlineKeyboardButton(
+                    f"All ({len(models)})",
+                    callback_data=f"model:f:{provider_name}:_all",
+                )]
+            )
+            # Back button
+            buttons.append(
+                [InlineKeyboardButton(
+                    "<< Back",
+                    callback_data="model:p:_back",
+                )]
+            )
+            await query.edit_message_text(
+                text=f"*{provider_name}* — select family:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+        except Exception as e:
+            logger.warning("[%s] _model_pick_provider failed: %s", self.name, e)
+            try:
+                await query.edit_message_text(text=f"Error: {e}")
+            except Exception:
+                pass
+
+    async def _model_pick_family(self, query, provider_name: str, family: str) -> None:
+        """Show model buttons for a specific family (or all)."""
+        state = getattr(self, "_model_picker_state", {}).get(
+            str(query.message.chat.id)
+        )
+        if not state or state["provider"] != provider_name:
+            await query.answer(text="Session expired, use /model again")
+            return
+
+        models = state["models"]
+        if family == "_all":
+            subset = models
+        else:
+            subset = [m for m in models if m.family == family]
+
+        if not subset:
+            await query.answer(text="No models in this family")
+            return
+
+        # Show top 10 models, use index into full models list
+        PAGE_SIZE = 10
+        buttons = []
+        for m in subset[:PAGE_SIZE]:
+            idx = models.index(m)
+            # Short display name: strip common provider prefixes
+            display = m.id
+            for prefix in (
+                "openrouter/", "anthropic/", "google/",
+                "deepseek/", "openai/", "meta-llama/",
+                "mistralai/", "microsoft/",
+            ):
+                if display.startswith(prefix):
+                    display = display[len(prefix):]
+                    break
+            cb = f"model:s:{idx}"
+            buttons.append([InlineKeyboardButton(display, callback_data=cb)])
+
+        remaining = len(subset) - PAGE_SIZE
+        if remaining > 0:
+            # Store page state for pagination
+            state["current_family"] = family
+            state["page"] = 0
+            buttons.append(
+                [InlineKeyboardButton(
+                    f"More ({remaining})...",
+                    callback_data=f"model:n:{provider_name}:1",
+                )]
+            )
+
+        # Back to families button
+        buttons.append(
+            [InlineKeyboardButton(
+                "<< Families",
+                callback_data=f"model:p:{provider_name}",
+            )]
+        )
+        title = f"*{provider_name}* / {family}" if family != "_all" else f"*{provider_name}* / all"
+        await query.edit_message_text(
+            text=f"{title} — select model:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        await query.answer()
+
+    async def _model_pick_set(self, query, index_str: str) -> None:
+        """Set the selected model."""
+        state = getattr(self, "_model_picker_state", {}).get(
+            str(query.message.chat.id)
+        )
+        if not state:
+            await query.answer(text="Session expired, use /model again")
+            return
+
+        try:
+            idx = int(index_str)
+            model = state["models"][idx]
+        except (ValueError, IndexError):
+            await query.answer(text="Invalid selection")
+            return
+
+        provider_name = state["provider"]
+
+        # Store session override on gateway_runner
+        runner = getattr(self, "gateway_runner", None)
+        if runner:
+            from agent.providers import PROVIDER_FACTORIES, _env_getter
+            try:
+                provider_obj = PROVIDER_FACTORIES[provider_name](_env_getter)
+                session_key = None
+                # Derive session key from chat_id
+                chat_id = str(query.message.chat.id)
+                # Use the runner's session key format
+                from gateway.config import Platform
+                from gateway.session import SessionSource
+                source = SessionSource(
+                    platform=Platform.TELEGRAM,
+                    chat_id=chat_id,
+                )
+                session_key = runner._session_key_for_source(source)
+
+                if not hasattr(runner, "_session_model_overrides"):
+                    runner._session_model_overrides = {}
+                runner._session_model_overrides[session_key] = {
+                    "model": model.id,
+                    "provider": provider_name,
+                    "api_key": provider_obj.api_key,
+                    "base_url": provider_obj.base_url,
+                }
+
+                # Invalidate cached agent so next turn uses new model
+                _cache = getattr(runner, "_agent_cache", None)
+                _lock = getattr(runner, "_agent_cache_lock", None)
+                if _cache is not None and _lock:
+                    with _lock:
+                        _cache.pop(session_key, None)
+
+                # Store model note for next turn
+                if not hasattr(runner, "_pending_model_notes"):
+                    runner._pending_model_notes = {}
+                runner._pending_model_notes[session_key] = (
+                    f"[Note: model switched to {model.id} "
+                    f"via {provider_name}.]"
+                )
+            except Exception as exc:
+                logger.warning("Model picker set failed: %s", exc)
+                await query.answer(text=f"Error: {exc}")
+                return
+
+        # Clean up picker state
+        picker_state = getattr(self, "_model_picker_state", {})
+        picker_state.pop(str(query.message.chat.id), None)
+
+        ctx_str = f"{model.context_length:,}" if model.context_length else "?"
+        await query.answer(text=f"Set: {model.id}")
+        try:
+            await query.edit_message_text(
+                text=(
+                    f"Model: `{model.id}`\n"
+                    f"Provider: {provider_name}\n"
+                    f"Context: {ctx_str} tokens\n"
+                    f"_(session only)_"
+                ),
+                parse_mode="Markdown",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+    async def _model_pick_page(self, query, provider_name: str, page: int) -> None:
+        """Show next page of models for current family."""
+        state = getattr(self, "_model_picker_state", {}).get(
+            str(query.message.chat.id)
+        )
+        if not state or state["provider"] != provider_name:
+            await query.answer(text="Session expired, use /model again")
+            return
+
+        family = state.get("current_family", "_all")
+        models = state["models"]
+        if family == "_all":
+            subset = models
+        else:
+            subset = [m for m in models if m.family == family]
+
+        PAGE_SIZE = 10
+        start = page * PAGE_SIZE
+        page_models = subset[start : start + PAGE_SIZE]
+        if not page_models:
+            await query.answer(text="No more models")
+            return
+
+        buttons = []
+        for m in page_models:
+            idx = models.index(m)
+            display = m.id
+            for prefix in (
+                "openrouter/", "anthropic/", "google/",
+                "deepseek/", "openai/", "meta-llama/",
+                "mistralai/", "microsoft/",
+            ):
+                if display.startswith(prefix):
+                    display = display[len(prefix):]
+                    break
+            buttons.append(
+                [InlineKeyboardButton(display, callback_data=f"model:s:{idx}")]
+            )
+
+        remaining = len(subset) - (start + PAGE_SIZE)
+        if remaining > 0:
+            buttons.append(
+                [InlineKeyboardButton(
+                    f"More ({remaining})...",
+                    callback_data=f"model:n:{provider_name}:{page + 1}",
+                )]
+            )
+
+        buttons.append(
+            [InlineKeyboardButton(
+                "<< Families",
+                callback_data=f"model:p:{provider_name}",
+            )]
+        )
+        title = f"*{provider_name}* / {family}" if family != "_all" else f"*{provider_name}* / all"
+        await query.edit_message_text(
+            text=f"{title} — page {page + 1}:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        await query.answer()
 
     async def send_voice(
         self,

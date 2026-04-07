@@ -3527,8 +3527,20 @@ class GatewayRunner:
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
 
-        # No args: show authenticated providers with models
+        # No args: show inline model picker on Telegram, text list otherwise
         if not model_input and not explicit_provider:
+            # Try inline picker on platforms that support it
+            adapter = self.adapters.get(source.platform)
+            if adapter and hasattr(adapter, "send_model_picker"):
+                metadata = {"thread_id": source.thread_id} if source.thread_id else None
+                current_info = (
+                    f"Current: `{current_model or 'unknown'}` on {current_provider}"
+                )
+                await adapter.send(source.chat_id, current_info, metadata=metadata)
+                await adapter.send_model_picker(source.chat_id, metadata=metadata)
+                return ""
+
+            # Fallback: text-based list
             provider_label = get_label(current_provider)
             lines = [f"Current: `{current_model or 'unknown'}` on {provider_label}", ""]
 
