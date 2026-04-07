@@ -1011,170 +1011,108 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
-        """Handle inline keyboard button clicks (update prompts, clarify)."""
+        """Handle all inline keyboard button clicks."""
         query = update.callback_query
         if not query or not query.data:
             return
         data = query.data
+        prefix = data.split(":")[0]
 
-        # --- Clarify tool responses ---
-        if data.startswith("clarify:"):
-            await self._handle_clarify_callback(query, data)
-            return
+        handlers = {
+            "update_prompt": self._cb_update_prompt,
+            "clarify": self._cb_clarify,
+            "exec_approve": self._cb_exec_approve,
+        }
+        handler = handlers.get(prefix)
+        if handler:
+            await handler(query, data)
 
-        # --- Approval responses (our custom) ---
-        if data.startswith("approval:"):
-            await self._handle_approval_callback(query, data)
-            return
+    # -- Callback handlers (one per prefix) --
 
-        # --- Exec approval responses (native gateway flow) ---
-        if data.startswith("exec_approve:"):
-            await self._handle_exec_approval_callback(query, data)
-            return
-
-        if not data.startswith("update_prompt:"):
-            return
-        answer = data.split(":", 1)[1]  # "y" or "n"
-        await query.answer(text=f"Sent '{answer}' to the update process.")
-        # Edit the message to show the choice and remove buttons
+    async def _cb_update_prompt(self, query, data: str) -> None:
+        answer = data.split(":", 1)[1]
         label = "Yes" if answer == "y" else "No"
+        await query.answer(text=f"Sent '{answer}' to the update process.")
         try:
             await query.edit_message_text(
-                text=f"⚕ Update prompt answered: *{label}*",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=None,
+                text=f"Update prompt answered: *{label}*",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=None,
             )
         except Exception:
-            pass  # non-fatal if edit fails
-        # Write the response file
+            pass
         try:
             from hermes_constants import get_hermes_home
-            home = get_hermes_home()
-            response_path = home / ".update_response"
-            tmp = response_path.with_suffix(".tmp")
+            path = get_hermes_home() / ".update_response"
+            tmp = path.with_suffix(".tmp")
             tmp.write_text(answer)
-            tmp.replace(response_path)
-            logger.info("Telegram update prompt answered '%s' by user %s",
-                        answer, getattr(query.from_user, "id", "unknown"))
+            tmp.replace(path)
         except Exception as exc:
-            logger.error("Failed to write update response from callback: %s", exc)
+            logger.error("Failed to write update response: %s", exc)
 
-    async def _handle_clarify_callback(self, query, data: str) -> None:
-        """Handle clarify tool inline button responses."""
-        # data format: "clarify:<id_part1>:<id_part2>:<choice_index>"
-        # e.g. "clarify:clr:abcd1234:1712345678:0"
-        prefix = "clarify:"
-        remainder = data[len(prefix):]  # "clr:abcd1234:1712345678:0"
-        last_colon = remainder.rfind(":")
-        if last_colon < 0:
+    async def _cb_clarify(self, query, data: str) -> None:
+        # data: "clarify:<id>:<choice>" e.g. "clarify:clr:abc:123:0"
+        remainder = data[len("clarify:"):]
+        sep = remainder.rfind(":")
+        if sep < 0:
             return
-        clarify_id = remainder[:last_colon]  # "clr:abcd1234:1712345678"
-        choice_key = remainder[last_colon + 1:]  # "0" or "other"
+        cid, choice_key = remainder[:sep], remainder[sep + 1:]
 
-        # Find the pending clarify in the gateway runner
         runner = getattr(self, "gateway_runner", None)
-        if not runner:
-            await query.answer(text="Session expired")
-            return
-        pending = getattr(runner, "_pending_clarifies", {})
-        entry = pending.get(clarify_id)
+        pending = getattr(runner, "_gateway_pending", {}) if runner else {}
+        entry = pending.get(cid)
         if not entry:
-            await query.answer(text="This question has expired")
+            await query.answer(text="Expired")
             return
 
-        choices = entry.get("choices") or []
         if choice_key == "other":
-            # User wants to type a custom answer -- edit message to prompt
-            await query.answer(text="Type your answer in chat")
+            await query.answer(text="Type your answer")
             try:
                 await query.edit_message_text(
                     text=f"{query.message.text}\n\n_Type your answer:_",
-                    parse_mode="Markdown",
-                    reply_markup=None,
+                    parse_mode="Markdown", reply_markup=None,
                 )
             except Exception:
                 pass
-            # Set a flag so the next text message from this chat resolves the clarify
             entry["awaiting_text"] = True
             return
 
-        # Numbered choice
+        choices = entry.get("choices") or []
         try:
-            idx = int(choice_key)
-            answer = choices[idx] if idx < len(choices) else f"(choice {idx})"
+            answer = choices[int(choice_key)]
         except (ValueError, IndexError):
             answer = choice_key
+        await self._resolve_callback(query, entry, answer)
 
-        await query.answer(text=f"Selected: {answer}")
-        try:
-            await query.edit_message_text(
-                text=f"{query.message.text}\n\n> {answer}",
-                parse_mode="Markdown",
-                reply_markup=None,
-            )
-        except Exception:
-            pass
-
-        entry["response"] = answer
-        entry["event"].set()
-
-    async def _handle_approval_callback(self, query, data: str) -> None:
-        """Handle approval tool inline button responses."""
-        # data format: "approval:apr:XXXX:TS:once"
-        remainder = data[len("approval:"):]
-        last_colon = remainder.rfind(":")
-        if last_colon < 0:
-            return
-        approval_id = remainder[:last_colon]
-        choice = remainder[last_colon + 1:]
-
-        runner = getattr(self, "gateway_runner", None)
-        if not runner:
-            await query.answer(text="Session expired")
-            return
-        pending = getattr(runner, "_pending_clarifies", {})
-        entry = pending.get(approval_id)
-        if not entry:
-            await query.answer(text="This prompt has expired")
-            return
-
-        labels = {"once": "Once", "session": "Session", "always": "Always", "deny": "Denied"}
-        await query.answer(text=f"Command: {labels.get(choice, choice)}")
-        try:
-            await query.edit_message_text(
-                text=f"{query.message.text}\n\n> {labels.get(choice, choice)}",
-                parse_mode="Markdown",
-                reply_markup=None,
-            )
-        except Exception:
-            pass
-
-        entry["response"] = choice
-        entry["event"].set()
-
-    async def _handle_exec_approval_callback(self, query, data: str) -> None:
-        """Handle exec approval inline button clicks."""
+    async def _cb_exec_approve(self, query, data: str) -> None:
         # data: "exec_approve:<session_key>:<choice>"
         parts = data.split(":")
         if len(parts) < 3:
             return
-        session_key = parts[1]
-        choice = parts[2]
-
+        session_key, choice = parts[1], parts[2]
         from tools.approval import resolve_gateway_approval
-        count = resolve_gateway_approval(session_key, choice)
-
+        resolve_gateway_approval(session_key, choice)
         labels = {"once": "Once", "session": "Session", "always": "Always", "deny": "Denied"}
-        label = labels.get(choice, choice)
-        await query.answer(text=f"Command: {label}")
+        await query.answer(text=labels.get(choice, choice))
         try:
             await query.edit_message_text(
-                text=f"{query.message.text}\n\n> {label}",
-                parse_mode="Markdown",
-                reply_markup=None,
+                text=f"{query.message.text}\n\n> {labels.get(choice, choice)}",
+                parse_mode="Markdown", reply_markup=None,
             )
         except Exception:
             pass
+
+    async def _resolve_callback(self, query, entry: dict, answer: str) -> None:
+        """Common: acknowledge query, edit message, unblock waiting thread."""
+        await query.answer(text=answer[:40])
+        try:
+            await query.edit_message_text(
+                text=f"{query.message.text}\n\n> {answer}",
+                parse_mode="Markdown", reply_markup=None,
+            )
+        except Exception:
+            pass
+        entry["response"] = answer
+        entry["event"].set()
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
@@ -1186,23 +1124,18 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         try:
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-            cmd_preview = command if len(command) <= 200 else command[:200] + "..."
-            buttons = [[
-                InlineKeyboardButton("Once", callback_data=f"exec_approve:{session_key}:once"),
-                InlineKeyboardButton("Session", callback_data=f"exec_approve:{session_key}:session"),
-                InlineKeyboardButton("Always", callback_data=f"exec_approve:{session_key}:always"),
-                InlineKeyboardButton("Deny", callback_data=f"exec_approve:{session_key}:deny"),
-            ]]
-            markup = InlineKeyboardMarkup(buttons)
-            thread_id = metadata.get("thread_id") if metadata else None
+            cmd_preview = command[:200] + "..." if len(command) > 200 else command
+            buttons = [[InlineKeyboardButton(label, callback_data=f"exec_approve:{session_key}:{key}")
+                        for key, label in [("once", "Once"), ("session", "Session"),
+                                           ("always", "Always"), ("deny", "Deny")]]]
             kwargs = {}
-            if thread_id:
-                kwargs["message_thread_id"] = int(thread_id)
+            if metadata and metadata.get("thread_id"):
+                kwargs["message_thread_id"] = int(metadata["thread_id"])
             msg = await self._bot.send_message(
                 chat_id=int(chat_id),
                 text=f"*Dangerous command:* {description}\n`{cmd_preview}`",
                 parse_mode="Markdown",
-                reply_markup=markup,
+                reply_markup=InlineKeyboardMarkup(buttons),
                 **kwargs,
             )
             return SendResult(success=True, message_id=str(msg.message_id))
