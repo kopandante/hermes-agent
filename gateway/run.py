@@ -1838,6 +1838,20 @@ class GatewayRunner:
                 label = response_text if len(response_text) <= 20 else response_text[:20] + "…"
                 return f"✓ Sent `{label}` to the update process."
 
+        # Intercept text responses to pending clarify "Other" prompts.
+        _pending_clarifies = getattr(self, "_pending_clarifies", {})
+        if _pending_clarifies:
+            chat_id = source.chat_id
+            for cid, entry in list(_pending_clarifies.items()):
+                if entry.get("awaiting_text") and entry.get("chat_id") == chat_id:
+                    text = (event.text or "").strip()
+                    if text:
+                        entry["response"] = text
+                        entry["awaiting_text"] = False
+                        entry["event"].set()
+                        return f"> {text}"
+                    break
+
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
         # are handled with minimal latency.
@@ -6510,6 +6524,161 @@ class GatewayRunner:
                     logger.debug("background_review_callback error: %s", _e)
 
             agent.background_review_callback = _bg_review_send
+
+            # Clarify callback — send inline keyboard buttons on Telegram,
+            # fall back to numbered list on other platforms.
+            def _clarify_sync(question: str, choices: list = None) -> str:
+                import concurrent.futures
+                _clarify_id = f"clr:{session_id[-8:]}:{int(time.time())}"
+
+                async def _send_clarify():
+                    from gateway.platforms.telegram import TelegramAdapter
+                    if isinstance(_status_adapter, TelegramAdapter) and choices:
+                        # Telegram: use inline keyboard buttons
+                        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                        buttons = []
+                        for i, choice in enumerate(choices):
+                            buttons.append([InlineKeyboardButton(
+                                choice, callback_data=f"clarify:{_clarify_id}:{i}"
+                            )])
+                        # Add "Other" option
+                        buttons.append([InlineKeyboardButton(
+                            "Other (type your answer)", callback_data=f"clarify:{_clarify_id}:other"
+                        )])
+                        markup = InlineKeyboardMarkup(buttons)
+                        result = await _status_adapter._bot.send_message(
+                            chat_id=int(_status_chat_id),
+                            text=f"**{question}**",
+                            parse_mode="Markdown",
+                            reply_markup=markup,
+                        )
+                        return result.message_id
+                    else:
+                        # Non-Telegram: numbered list
+                        text = f"**{question}**\n"
+                        if choices:
+                            for i, c in enumerate(choices, 1):
+                                text += f"{i}. {c}\n"
+                            text += f"{len(choices)+1}. Other (type your answer)\n"
+                        text += "\n_Reply with your choice:_"
+                        await _status_adapter.send(
+                            _status_chat_id, text,
+                            metadata=_status_thread_metadata,
+                        )
+                        return None
+
+                # Send the clarify question from the event loop
+                try:
+                    future = asyncio.run_coroutine_threadsafe(_send_clarify(), _loop_for_step)
+                    msg_id = future.result(timeout=15)
+                except Exception as exc:
+                    logger.warning("clarify send failed: %s", exc)
+                    return "(clarify prompt failed to send)"
+
+                # Register a pending clarify and wait for user response
+                _pending = getattr(self, "_pending_clarifies", None)
+                if _pending is None:
+                    self._pending_clarifies = {}
+                    _pending = self._pending_clarifies
+                response_event = threading.Event()
+                _pending[_clarify_id] = {"event": response_event, "response": None, "choices": choices, "msg_id": msg_id, "chat_id": _status_chat_id}
+
+                # Wait up to 120 seconds for user response
+                if response_event.wait(timeout=120):
+                    answer = _pending[_clarify_id]["response"]
+                else:
+                    answer = "(no response within timeout)"
+                _pending.pop(_clarify_id, None)
+                return answer or "(empty response)"
+
+            agent.clarify_callback = _clarify_sync
+
+            # Approval callback — inline keyboard for dangerous command approval
+            def _approval_sync(command: str, description: str, *, allow_permanent: bool = True) -> str:
+                _appr_id = f"apr:{session_id[-8:]}:{int(time.time())}"
+                choices = ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
+
+                async def _send_approval():
+                    from gateway.platforms.telegram import TelegramAdapter
+                    if isinstance(_status_adapter, TelegramAdapter):
+                        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                        labels = {"once": "Once", "session": "Session", "always": "Always", "deny": "Deny"}
+                        buttons = [[
+                            InlineKeyboardButton(labels[c], callback_data=f"approval:{_appr_id}:{c}")
+                            for c in choices
+                        ]]
+                        markup = InlineKeyboardMarkup(buttons)
+                        cmd_preview = command if len(command) <= 200 else command[:200] + "..."
+                        msg = await _status_adapter._bot.send_message(
+                            chat_id=int(_status_chat_id),
+                            text=f"*Dangerous command:* {description}\n`{cmd_preview}`",
+                            parse_mode="Markdown",
+                            reply_markup=markup,
+                        )
+                        return msg.message_id
+                    else:
+                        cmd_preview = command if len(command) <= 200 else command[:200] + "..."
+                        text = f"*Dangerous command:* {description}\n`{cmd_preview}`\n\nReply: once / session / always / deny"
+                        await _status_adapter.send(_status_chat_id, text, metadata=_status_thread_metadata)
+                        return None
+
+                try:
+                    future = asyncio.run_coroutine_threadsafe(_send_approval(), _loop_for_step)
+                    msg_id = future.result(timeout=15)
+                except Exception as exc:
+                    logger.warning("approval send failed: %s", exc)
+                    return "deny"
+
+                _pending = getattr(self, "_pending_clarifies", None)
+                if _pending is None:
+                    self._pending_clarifies = {}
+                    _pending = self._pending_clarifies
+                response_event = threading.Event()
+                _pending[_appr_id] = {"event": response_event, "response": None, "choices": choices, "msg_id": msg_id, "chat_id": _status_chat_id}
+
+                if response_event.wait(timeout=60):
+                    answer = _pending[_appr_id]["response"] or "deny"
+                else:
+                    answer = "deny"
+                _pending.pop(_appr_id, None)
+                return answer
+
+            # Sudo password callback — ask user to type password in chat
+            def _sudo_sync() -> str:
+                _sudo_id = f"sudo:{session_id[-8:]}:{int(time.time())}"
+
+                async def _send_sudo():
+                    await _status_adapter.send(
+                        _status_chat_id,
+                        "*Sudo password required*\n_Reply with your password (or empty to skip):_",
+                        metadata=_status_thread_metadata,
+                    )
+
+                try:
+                    future = asyncio.run_coroutine_threadsafe(_send_sudo(), _loop_for_step)
+                    future.result(timeout=10)
+                except Exception:
+                    return ""
+
+                _pending = getattr(self, "_pending_clarifies", None)
+                if _pending is None:
+                    self._pending_clarifies = {}
+                    _pending = self._pending_clarifies
+                response_event = threading.Event()
+                _pending[_sudo_id] = {"event": response_event, "response": None, "awaiting_text": True, "chat_id": _status_chat_id}
+
+                if response_event.wait(timeout=45):
+                    return _pending[_sudo_id]["response"] or ""
+                _pending.pop(_sudo_id, None)
+                return ""
+
+            # Register global callbacks for this turn
+            from tools.terminal_tool import set_approval_callback, set_sudo_password_callback
+            set_approval_callback(_approval_sync)
+            set_sudo_password_callback(_sudo_sync)
+
+            # Mark this as a gateway session so approval.py doesn't auto-bypass
+            os.environ["HERMES_GATEWAY_SESSION"] = session_id
 
             # Store agent reference for interrupt support
             agent_holder[0] = agent
