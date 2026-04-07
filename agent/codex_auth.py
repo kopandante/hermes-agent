@@ -36,18 +36,37 @@ def _save_auth(data: dict) -> None:
 def load_codex_token() -> str | None:
     """Load and refresh codex access token. Returns None if not logged in."""
     auth = _load_auth()
+    # Support both formats:
+    # 1. Simple: {"tokens": {"access_token": ..., "refresh_token": ...}}
+    # 2. Credential pool: {"credential_pool": {"openai-codex": [{"access_token": ..., "refresh_token": ...}]}}
     tokens = auth.get("tokens", {})
     access = tokens.get("access_token")
     refresh = tokens.get("refresh_token")
+    last_refresh = auth.get("last_refresh", 0)
+    if not refresh:
+        # Try credential_pool format
+        pool = auth.get("credential_pool", {})
+        entries = pool.get("openai-codex", [])
+        if isinstance(entries, list) and entries:
+            entry = entries[0]
+            access = entry.get("access_token")
+            refresh = entry.get("refresh_token")
+            last_refresh = entry.get("last_refresh", 0)
     if not refresh:
         return None
     # Check if access token needs refresh (2 min skew)
-    last_refresh = auth.get("last_refresh", 0)
     if time.time() - last_refresh > 3300:  # refresh every ~55 min
         access = _refresh_token(refresh)
         if access:
-            auth["tokens"]["access_token"] = access
-            auth["last_refresh"] = time.time()
+            # Update whichever format we found
+            pool = auth.get("credential_pool", {})
+            entries = pool.get("openai-codex", [])
+            if isinstance(entries, list) and entries:
+                entries[0]["access_token"] = access
+                entries[0]["last_refresh"] = time.time()
+            else:
+                auth.setdefault("tokens", {})["access_token"] = access
+                auth["last_refresh"] = time.time()
             _save_auth(auth)
     return access
 
